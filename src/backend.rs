@@ -1,4 +1,5 @@
 use brightness::blocking::{Brightness, BrightnessDevice};
+use std::path::PathBuf;
 
 /// 亮度控制后端：优先硬件（DDC/CI 或笔记本面板 IOCTL），否则在 Windows 上使用伽马曲线。
 pub enum BrightnessBackend {
@@ -23,12 +24,13 @@ impl BrightnessBackend {
 
         #[cfg(windows)]
         {
-            let gamma = GammaBrightness::new();
-            let level = gamma.get();
+            let mut gamma = GammaBrightness::new();
+            let level = load_saved_brightness().unwrap_or(100);
+            let _ = gamma.set(level);
             return (
                 Self::Software(gamma),
                 level,
-                "软件伽马 · 外接屏需在显示器菜单中开启 DDC/CI 才能用硬件控制".into(),
+                "软件伽马 · 退出后仍保持（重启或注销后恢复）· 开启 DDC/CI 可改用硬件控制".into(),
             );
         }
 
@@ -42,33 +44,65 @@ impl BrightnessBackend {
 
     pub fn set(&mut self, percent: u32) -> Result<(), String> {
         let percent = percent.min(100);
-        match self {
+        let result = match self {
             Self::Hardware(dev) => dev.set(percent).map_err(|e| e.to_string()),
             #[cfg(windows)]
             Self::Software(g) => g.set(percent),
             #[cfg(not(windows))]
             Self::Unavailable => Err("无可用亮度控制".into()),
+        };
+        if result.is_ok() {
+            save_brightness(percent);
         }
+        result
     }
+}
+
+fn config_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA").map(|base| {
+            PathBuf::from(base)
+                .join("screen-brightness")
+                .join("brightness.txt")
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(|base| {
+            PathBuf::from(base)
+                .join(".config")
+                .join("screen-brightness")
+                .join("brightness.txt")
+        })
+    }
+}
+
+fn load_saved_brightness() -> Option<u32> {
+    let text = std::fs::read_to_string(config_path()?).ok()?;
+    let v: u32 = text.trim().parse().ok()?;
+    Some(v.min(100))
+}
+
+fn save_brightness(percent: u32) {
+    let Some(path) = config_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, percent.to_string());
 }
 
 #[cfg(windows)]
 pub struct GammaBrightness {
-    saved_ramp: Option<[[u16; 256]; 3]>,
     level: u32,
 }
 
 #[cfg(windows)]
 impl GammaBrightness {
     pub fn new() -> Self {
-        Self {
-            saved_ramp: capture_gamma_ramp(),
-            level: 100,
-        }
-    }
-
-    pub fn get(&self) -> u32 {
-        self.level
+        Self { level: 100 }
     }
 
     pub fn set(&mut self, percent: u32) -> Result<(), String> {
@@ -76,33 +110,6 @@ impl GammaBrightness {
         apply_gamma_ramp(percent)?;
         self.level = percent;
         Ok(())
-    }
-}
-
-#[cfg(windows)]
-impl Drop for GammaBrightness {
-    fn drop(&mut self) {
-        if let Some(ramp) = self.saved_ramp.take() {
-            let _ = restore_gamma_ramp(&ramp);
-        }
-    }
-}
-
-#[cfg(windows)]
-fn capture_gamma_ramp() -> Option<[[u16; 256]; 3]> {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
-    use windows::Win32::UI::ColorSystem::GetDeviceGammaRamp;
-
-    unsafe {
-        let hdc = GetDC(Some(HWND::default()));
-        if hdc.is_invalid() {
-            return None;
-        }
-        let mut ramp = [[0u16; 256]; 3];
-        let ok = GetDeviceGammaRamp(hdc, &mut ramp as *mut _ as *mut _).as_bool();
-        let _ = ReleaseDC(Some(HWND::default()), hdc);
-        ok.then_some(ramp)
     }
 }
 
@@ -133,21 +140,3 @@ fn apply_gamma_ramp(percent: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn restore_gamma_ramp(ramp: &[[u16; 256]; 3]) -> Result<(), String> {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
-    use windows::Win32::UI::ColorSystem::SetDeviceGammaRamp;
-
-    unsafe {
-        let hdc = GetDC(Some(HWND::default()));
-        if hdc.is_invalid() {
-            return Err("无法获取显示设备上下文".into());
-        }
-        SetDeviceGammaRamp(hdc, ramp as *const _ as *const _)
-            .ok()
-            .map_err(|e| e.to_string())?;
-        let _ = ReleaseDC(Some(HWND::default()), hdc);
-    }
-    Ok(())
-}
