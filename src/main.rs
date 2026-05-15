@@ -1,4 +1,6 @@
-use brightness::blocking::{Brightness, BrightnessDevice};
+mod backend;
+
+use backend::BrightnessBackend;
 use eframe::egui;
 
 /// 加载支持中文的系统字体，避免 egui 默认字体显示为方框。
@@ -64,7 +66,7 @@ fn load_cjk_font_bytes() -> Option<Vec<u8>> {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 200.0])
+            .with_inner_size([420.0, 240.0])
             .with_resizable(false),
         ..Default::default()
     };
@@ -80,31 +82,21 @@ fn main() -> eframe::Result {
 }
 
 struct BrightnessApp {
-    brightness: u32,          // 当前亮度 (0-100)
-    devices: Vec<BrightnessDevice>,
+    brightness: u32,
+    backend: BrightnessBackend,
+    mode_label: String,
     status: String,
 }
 
 impl Default for BrightnessApp {
     fn default() -> Self {
-        let devices: Vec<BrightnessDevice> = brightness::blocking::brightness_devices()
-            .filter_map(Result::ok)
-            .collect();
-
-        let mut app = Self {
-            brightness: 50,
-            devices,
+        let (backend, brightness, mode_label) = BrightnessBackend::discover();
+        Self {
+            brightness,
+            backend,
+            mode_label,
             status: String::new(),
-        };
-
-        // 初始化读取当前亮度
-        if let Some(dev) = app.devices.first() {
-            if let Ok(val) = dev.get() {
-                app.brightness = val;
-            }
         }
-
-        app
     }
 }
 
@@ -112,25 +104,28 @@ impl eframe::App for BrightnessApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("屏幕亮度调节");
-            ui.add_space(20.0);
+            ui.add_space(12.0);
 
-            if self.devices.is_empty() {
-                ui.label("未检测到亮度设备（可能不支持或权限问题）");
+            ui.label(&self.mode_label);
+            ui.add_space(12.0);
+
+            #[cfg(not(windows))]
+            if matches!(self.backend, BrightnessBackend::Unavailable) {
+                ui.label("未检测到可用的亮度控制方式");
                 return;
             }
 
-            // 滑块
             let response = ui.add(
                 egui::Slider::new(&mut self.brightness, 0..=100)
                     .text("亮度 (%)")
-                    .step_by(1.0)
+                    .step_by(1.0),
             );
 
             if response.changed() {
-                self.set_brightness();
+                self.apply_brightness();
             }
 
-            ui.add_space(10.0);
+            ui.add_space(8.0);
             ui.label(format!("当前亮度: {}%", self.brightness));
 
             if !self.status.is_empty() {
@@ -139,31 +134,22 @@ impl eframe::App for BrightnessApp {
 
             ui.separator();
 
-            if ui.button("刷新设备").clicked() {
-                self.devices = brightness::blocking::brightness_devices()
-                    .filter_map(Result::ok)
-                    .collect();
-                self.status = format!("找到 {} 个设备", self.devices.len());
+            if ui.button("刷新并重试硬件").clicked() {
+                let (backend, brightness, mode_label) = BrightnessBackend::discover();
+                self.backend = backend;
+                self.brightness = brightness;
+                self.mode_label = mode_label;
+                self.status.clear();
             }
-
-            ui.label(format!("检测到设备数量: {}", self.devices.len()));
         });
     }
 }
 
 impl BrightnessApp {
-    fn set_brightness(&mut self) {
-        if let Some(dev) = self.devices.first() {
-            match dev.set(self.brightness) {
-                Ok(_) => {
-                    self.status = format!("已设置为 {}%", self.brightness);
-                }
-                Err(e) => {
-                    self.status = format!("设置失败: {}", e);
-                }
-            }
-        } else {
-            self.status = "没有可用设备".to_string();
+    fn apply_brightness(&mut self) {
+        match self.backend.set(self.brightness) {
+            Ok(()) => self.status = format!("已设置为 {}%", self.brightness),
+            Err(e) => self.status = format!("设置失败: {e}"),
         }
     }
 }
